@@ -20,13 +20,12 @@ from nunif.utils.ui import is_image, is_video, is_text, is_output_dir, make_pare
 from nunif.device import create_device, autocast, device_is_mps, device_is_cuda, mps_is_available, xpu_is_available
 from nunif.models.data_parallel import DeviceSwitchInference
 from . import export_config
-from . dilation import dilate_edge
-from . forward_warp import apply_divergence_forward_warp
-from . anaglyph import apply_anaglyph_redcyan
-from . mapper import get_mapper, resolve_mapper_name
-from . depth_model_factory import create_depth_model
-from . base_depth_model import BaseDepthModel
-
+from .dilation import dilate_edge
+from .forward_warp import apply_divergence_forward_warp
+from .anaglyph import apply_anaglyph_redcyan
+from .mapper import get_mapper, resolve_mapper_name
+from .depth_model_factory import create_depth_model
+from .base_depth_model import BaseDepthModel
 
 HUB_MODEL_DIR = path.join(path.dirname(__file__), "pretrained_models", "hub")
 REMBG_MODEL_DIR = path.join(path.dirname(__file__), "pretrained_models", "rembg")
@@ -689,31 +688,45 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
 
 
 def process_video_full(input_filename, output_path, args, depth_model, side_model):
+    """
+    处理视频主方法
+    """
+
+    # 是否允许 指数移动平均 (EMA) 优化
     ema_normalize = args.ema_normalize and args.max_fps >= 15
     if ema_normalize:
         depth_model.enable_ema_minmax(args.ema_decay)
 
+    # 使用torch.compile来加速模型推理, 具体原理是使用jit(Just In Time)技术来实现, 把运行的代码优化编译成机器码，提升运行性能
     if args.compile and side_model is not None and not isinstance(side_model, DeviceSwitchInference):
         side_model = compile_model(side_model)
 
+    # 判断输出路径是目录还是文件
     if is_output_dir(output_path):
+        # 如果是目录，则创建
         os.makedirs(output_path, exist_ok=True)
+        # 生成输出文件名称
         output_filename = path.join(
             output_path,
             make_output_filename(path.basename(input_filename), args, video=True))
     else:
+        # 如果是文件则直接使用路径作为文件名
         output_filename = output_path
 
+    # 如果运行恢复处理并且输出文件已存在，则直接返回
     if args.resume and path.exists(output_filename):
         return
 
+    # 如果输出文件已存在则判断是否需要覆盖，不覆盖则直接返回
     if not args.yes and path.exists(output_filename):
         y = input(f"File '{output_filename}' already exists. Overwrite? [y/N]").lower()
         if y not in {"y", "ye", "yes"}:
             return
 
+    # 创建输出文件的上级目录
     make_parent_dir(output_filename)
 
+    # 输出视频文件的一些参数配置，如fps、视频格式、视频编码等
     def config_callback(stream):
         fps = VU.get_fps(stream)
         if float(fps) > args.max_fps:
@@ -729,22 +742,27 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
             container_options={"movflags": "+faststart"} if args.video_format == "mp4" else {},
         )
 
+    # test回调
+    # 设置推理模式，以提升性能，比 torch.no_grad() 优化更好
     @torch.inference_mode()
     def test_callback(frame):
-        frame = VU.to_frame(process_image(VU.to_tensor(frame, device=args.state["device"]), args, depth_model, side_model,
-                                          return_tensor=True))
+        frame = VU.to_frame(
+            process_image(VU.to_tensor(frame, device=args.state["device"]), args, depth_model, side_model,
+                          return_tensor=True))
         if ema_normalize:
             # reset ema to avoid affecting test frames
             depth_model.reset_ema_minmax()
         return frame
 
+    # 如果允许使用更低内存模式，则逐帧处理
     if args.low_vram or args.debug_depth:
         @torch.inference_mode()
         def frame_callback(frame):
             if frame is None:
                 return None
-            return VU.to_frame(process_image(VU.to_tensor(frame, device=args.state["device"]), args, depth_model, side_model,
-                                             return_tensor=True))
+            return VU.to_frame(
+                process_image(VU.to_tensor(frame, device=args.state["device"]), args, depth_model, side_model,
+                              return_tensor=True))
 
         try:
             if args.compile:
@@ -765,6 +783,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
                 depth_model.clear_compiled_model()
 
     else:
+        # 批量处理
         minibatch_size = args.batch_size // 2 or 1 if args.tta else args.batch_size
         preprocess_lock = [threading.Lock() for _ in range(len(args.state["devices"]))]
         depth_lock = [threading.Lock() for _ in range(len(args.state["devices"]))]
@@ -788,14 +807,18 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
             else:
                 x_orgs = x
             with depth_lock[device_index]:
+                # 深度模型推理
                 depths = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
                                            enable_amp=not args.disable_amp,
                                            edge_dilation=args.edge_dilation)
+                # 值归一化处理
                 depths = depth_model.minmax_normalize(depths)
 
             if args.method in {"forward", "forward_fill"}:
                 # Lock all threads
                 # forward_warp uses torch.use_deterministic_algorithms() and it seems to be not thread-safe
+
+                # 如果使用forward相关方法，apply_divergence 中会 调用 apply_divergence_forward_warp 方法，这个方法需要解决线程安全问题
                 with sbs_lock[device_index], preprocess_lock[device_index], depth_lock[device_index]:
                     left_eyes, right_eyes = apply_divergence(depths, x_orgs, args, side_model)
             else:
@@ -871,9 +894,11 @@ def process_video_keyframes(input_filename, output_path, args, depth_model, side
             output = process_image(im, args, depth_model, side_model)
             output_filename = path.join(
                 output_dir,
-                path.basename(output_dir) + "_" + str(frame.pts).zfill(8) + FULL_SBS_SUFFIX + get_image_ext(args.format))
+                path.basename(output_dir) + "_" + str(frame.pts).zfill(8) + FULL_SBS_SUFFIX + get_image_ext(
+                    args.format))
             f = pool.submit(save_image, output, output_filename, format=args.format)
             futures.append(f)
+
         VU.process_video_keyframes(input_filename, frame_callback=frame_callback,
                                    min_interval_sec=args.keyframe_interval,
                                    stop_event=args.state["stop_event"],
@@ -1771,7 +1796,8 @@ def load_sbs_model(args):
 
 def iw3_main(args):
     assert not (args.rotate_left and args.rotate_right)
-    assert sum([1 for flag in (args.half_sbs, args.vr180, args.anaglyph, args.tb, args.half_tb, args.cross_eyed) if flag]) < 2
+    assert sum(
+        [1 for flag in (args.half_sbs, args.vr180, args.anaglyph, args.tb, args.half_tb, args.cross_eyed) if flag]) < 2
 
     if len(args.gpu) > 1 and len(args.gpu) > args.max_workers:
         # For GPU round-robin on thread pool
