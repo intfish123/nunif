@@ -104,6 +104,9 @@ def make_input_tensor(c, depth, divergence, convergence,
 
 
 def equirectangular_projection(c, device="cpu"):
+    """
+    这个方法将类似鱼眼图像转为平面图, 采用球面坐标到平面坐标映射原理
+    """
     c = c.to(device)
     h, w = c.shape[1:]
     max_edge = max(h, w)
@@ -532,28 +535,48 @@ def apply_divergence(depth, im_org, args, side_model):
 
 
 def postprocess_image(left_eye, right_eye, args):
+    """
+    微调、填充边缘，vr转换(如有必要)等，并拼接左右眼图像
+
+    :param left_eye: 左眼图像  CHW
+    :param right_eye: 右眼图像  CHW
+    :param args: 参数
+    :return: 返回拼接好的图像
+    """
     # CHW
+    # ipd_offset是个百分比?, ipd_offset转为小数后, 乘以 像素宽度?, 获取需要 ipd_pad 的像素
     ipd_pad = int(abs(args.ipd_offset) * 0.01 * left_eye.shape[2])
+    # 变成2的倍数
     ipd_pad -= ipd_pad % 2
     if ipd_pad > 0:
+        # 如果 ipd_offset > 0, pad_o 为 ipd_pad*2, pad_i 为 ipd_pad
+        # 如果 ipd_offset <= 0, pad_o 为 ipd_pad, pad_i 为 ipd_pad*2
+        # 如 ipd_pad = 50, ipd_offset > 0, pad_o为50, pad_i为100, ipd_offset <=0, pad_o为100, pad_i为50,
         pad_o, pad_i = (ipd_pad * 2, ipd_pad) if args.ipd_offset > 0 else (ipd_pad, ipd_pad * 2)
+
+        # 分别在图像左, 右, 上, 下填充 pad_o, 0, pad_i, 0 个像素，填充值为0
+        # 主要用于适应不同的瞳距, 增加立体感
         left_eye = TF.pad(left_eye, (pad_o, 0, pad_i, 0), padding_mode="constant")
         right_eye = TF.pad(right_eye, (pad_i, 0, pad_o, 0), padding_mode="constant")
 
     if args.pad is not None:
+        # args.pad为填充比例, 如 0.05
         pad_h = int(left_eye.shape[1] * args.pad) // 2
         pad_w = int(left_eye.shape[2] * args.pad) // 2
         left_eye = TF.pad(left_eye, (pad_w, pad_h, pad_w, pad_h), padding_mode="constant")
         right_eye = TF.pad(right_eye, (pad_w, pad_h, pad_w, pad_h), padding_mode="constant")
     if args.vr180:
+        # 如果设置的是vr180，采用equirectangular_projection将图像转换
         left_eye = equirectangular_projection(left_eye, device=left_eye.device)
         right_eye = equirectangular_projection(right_eye, device=right_eye.device)
     elif args.half_sbs:
+        # 将full_sbs 的宽度压缩一半保持跟之前的图像宽度一样
         left_eye = TF.resize(left_eye, (left_eye.shape[1], left_eye.shape[2] // 2),
                              interpolation=InterpolationMode.BICUBIC, antialias=True)
         right_eye = TF.resize(right_eye, (right_eye.shape[1], right_eye.shape[2] // 2),
                               interpolation=InterpolationMode.BICUBIC, antialias=True)
     elif args.half_tb:
+        # 将图像的高度压缩一半，保持跟之前的图像高度一样
         left_eye = TF.resize(left_eye, (left_eye.shape[1] // 2, left_eye.shape[2]),
                              interpolation=InterpolationMode.BICUBIC, antialias=True)
         right_eye = TF.resize(right_eye, (right_eye.shape[1] // 2, right_eye.shape[2]),
@@ -568,10 +591,12 @@ def postprocess_image(left_eye, right_eye, args):
         sbs = torch.clamp(sbs, 0., 1.)
     elif args.cross_eyed:
         # Reverse SideBySide
+        # 交叉眼
         sbs = torch.cat([right_eye, left_eye], dim=2)
         sbs = torch.clamp(sbs, 0., 1.)
     else:
         # SideBySide
+        # 平行眼
         sbs = torch.cat([left_eye, right_eye], dim=2)
         sbs = torch.clamp(sbs, 0., 1.)
 
@@ -824,7 +849,8 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
             else:
                 with sbs_lock[device_index]:
                     left_eyes, right_eyes = apply_divergence(depths, x_orgs, args, side_model)
-
+            # 使用 torch.stack 创建 所有的 一批次的结果图.
+            # stack和cat的区别是: stack会创建新维度, 如 shape为[3,4,8]与[3,4,8] stack, 会生成 shape为[2,3,4,8]的结果
             return torch.stack([
                 postprocess_image(left_eyes[i], right_eyes[i], args)
                 for i in range(left_eyes.shape[0])])
@@ -844,6 +870,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
                 return __batch_callback(x)
 
         extra_queue = 1 if len(args.state["devices"]) == 1 else 0
+        # 视频帧 回调
         frame_callback = VU.FrameCallbackPool(
             _batch_callback,
             batch_size=minibatch_size,
@@ -854,6 +881,8 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         try:
             if args.compile:
                 depth_model.compile()
+
+            # 具体的处理逻辑
             VU.process_video(input_filename, output_filename,
                              config_callback=config_callback,
                              frame_callback=frame_callback,

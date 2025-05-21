@@ -267,6 +267,9 @@ class VideoFilter(FixedFPSFilter):
 
 
 class VideoOutputConfig():
+    """
+    获取视频输出配置, 返回像素格式, fps, 视频编码等数据
+    """
     def __init__(self, pix_fmt="yuv420p", fps=30, options={}, container_options={},
                  output_width=None, output_height=None, colorspace=None,
                  container_format=None,
@@ -655,6 +658,22 @@ def process_video(input_path, output_path,
                   stop_event=None, suspend_event=None, tqdm_fn=None,
                   start_time=None, end_time=None,
                   test_callback=None):
+    """
+    Processes a video file and writes it to disk.
+    :param input_path: 视频输入路径
+    :param output_path: 输出路径
+    :param frame_callback: 使用该回调函数处理视频帧
+    :param config_callback: 使用该回调函数获取输出视频配置信息
+    :param title:
+    :param vf: 视频滤镜
+    :param stop_event: 停止事件
+    :param suspend_event: 暂停事件
+    :param tqdm_fn: 进度条函数
+    :param start_time: 视频开始时间
+    :param end_time: 视频结束时间
+    :param test_callback: 验证回调
+    :return:
+    """
     if isinstance(start_time, str):
         start_time = parse_time(start_time)
     if isinstance(end_time, str):
@@ -662,39 +681,57 @@ def process_video(input_path, output_path,
         if start_time is not None and not (start_time < end_time):
             raise ValueError("end_time must be greater than start_time")
 
+    # 输出临时文件
     output_path_tmp = path.join(path.dirname(output_path), "_tmp_" + path.basename(output_path))
+    # 使用pyav库打开视频
     input_container = av.open(input_path)
 
     if input_container.duration:
+        # 获取视频时长
         container_duration = float(input_container.duration / av.time_base)
     else:
         container_duration = None
 
+    # 如果没有视频流，则抛出异常
     if len(input_container.streams.video) == 0:
         raise ValueError("No video stream")
 
     if start_time is not None:
+        # 设置开始时间
         input_container.seek(start_time * av.time_base, backward=True, any_frame=False)
 
+    # 获取容器内的视频流
     video_input_stream = input_container.streams.video[0]
+
+    # FRAME：每帧分配一个线程（适合帧级并行）
+    # SLICE：按视频切片分配线程（H.264 等编码常用）
+    # AUTO：由 FFmpeg 自动选择最佳模式
     video_input_stream.thread_type = "AUTO"
+
     # _print_len(video_input_stream)
+    # 音频输入流
     audio_input_stream = audio_output_stream = None
     if len(input_container.streams.audio) > 0:
         # has audio stream
         audio_input_stream = input_container.streams.audio[0]
 
+    # 获取输出视频配置, 如像素格式，fps，视频编码等
     config = config_callback(video_input_stream)
     config.fps = convert_known_fps(config.fps)
     config.output_fps = convert_known_fps(config.output_fps)
 
     if not config.container_format:
+        # 获取文件后缀名
         config.container_format = path.splitext(output_path)[-1].lower()[1:]
     if not config.video_codec:
+        # 通过后缀名获取视频编码
         config.video_codec = get_default_video_codec(config.container_format)
+    # 调整各个参数适配不同视频编码
     configure_video_codec(config)
 
+    # 视频输出容器
     output_container = av.open(output_path_tmp, 'w', options=config.container_options)
+    # 调整输出视频的fps
     fps_filter = FixedFPSFilter(video_input_stream, fps=config.fps, vf=vf)
     if config.output_width is not None and config.output_height is not None:
         output_size = config.output_width, config.output_height
@@ -702,10 +739,14 @@ def process_video(input_path, output_path,
         if test_callback is None:
             # TODO: warning
             test_callback = frame_callback
+
+        # 获取输出视频宽度和高度
         output_size = test_output_size(test_callback, video_input_stream, vf)
 
     output_fps = config.output_fps or config.fps
+    # 向输出视频容器添加视频流
     video_output_stream = output_container.add_stream(config.video_codec, output_fps)
+    # 配置颜色空间
     configure_colorspace(video_output_stream, video_input_stream, config)
     video_output_stream.thread_type = "AUTO"
     video_output_stream.pix_fmt = config.pix_fmt
@@ -773,6 +814,7 @@ def process_video(input_path, output_path,
         if stop_event is not None and stop_event.is_set():
             break
 
+    # 处理最后剩余的帧
     while True:
         frame = fps_filter.update(None)
         if frame is not None:
@@ -786,6 +828,7 @@ def process_video(input_path, output_path,
         else:
             break
 
+    # 处理剩余的帧
     for new_frame in get_new_frames(frame_callback(None)):
         new_frame = reformatter(new_frame)
         enc_packet = video_output_stream.encode(new_frame)
@@ -796,12 +839,15 @@ def process_video(input_path, output_path,
     packet = video_output_stream.encode(None)
     if packet:
         output_container.mux(packet)
+
+    # 全部处理结束，关闭
     pbar.close()
     output_container.close()
     input_container.close()
 
     if not (stop_event is not None and stop_event.is_set()):
         # success
+        # 将临时文件重命名
         if path.exists(output_path_tmp):
             try_replace(output_path_tmp, output_path)
 
